@@ -11,7 +11,13 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 from argparse import ArgumentParser
 
+import configparser
 def get_arguments():
+    config = configparser.ConfigParser()
+    config.read('tools/config.ini',encoding='utf8')
+    src_file_name = config['config']['src_file_name']
+    src_file_ext = config['config']['src_file_ext']
+    object_num = config['config']['object_num']
     parser = ArgumentParser()
     """
     Priority 1: If a "images" folder exists in the workspace, we will read from that directory
@@ -22,11 +28,11 @@ def get_arguments():
     That way, you can continue annotation from an interrupted run as long as the same workspace is used.
     """
     parser.add_argument('--images', help='Folders containing input images.', default=None)
-    parser.add_argument('--video', help='Video file readable by OpenCV.', default=None)
+    parser.add_argument('--video', help='Video file readable by OpenCV.', default='source/%s.%s' % (src_file_name,src_file_ext))
     parser.add_argument('--workspace',
                         help='directory for storing buffered images (if needed) and output masks',
                         default=None)
-    parser.add_argument('--num_objects', type=int, default=1)
+    parser.add_argument('--num_objects', type=int, default=object_num)
     parser.add_argument('--workspace_init_only', action='store_true',
                         help='initialize the workspace and exit')
 
