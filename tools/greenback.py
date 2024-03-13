@@ -29,17 +29,18 @@ class GreenBack():
         #     self.codec = '-c:v hevc_nvenc -preset p7 -tune hq -rc-lookahead 20'
         # else:
         #     self.codec = '-c:v libx265 -crf 26'
-        self.codec = '-c:v libx265 -crf 25'
+        # self.codec = '-c:v libx265 -crf 25'
+        self.codec = '-c:v libvpx-vp9 -b:v 0 -crf 25 -auto-alt-ref 0'
         # 使用opencv提供的VideoWriter功能，否则使用ffmpeg
         self.videowriter_flag = False
         # 使用opencv提供的VideoCapture功能，否则使用ffmpeg
         self.videoreader_flag = True
-        # 测试模式，仅生成最多600帧视频
+        # 测试模式，仅生成最多120帧视频
         self.test_mode = False
         # mask中值滤波的ksize，越大越平滑，但细节丢失也越大,高斯41等效中值21
         self.mask_ksize = 41
         # mask范围，1-254，越大绿幕的范围越大
-        self.mask_range = 170
+        self.mask_range = 180
         # 是否启用跟踪
         self.focus_flag = False
         # 必须保证focus_width和focus_height是二的倍数
@@ -49,6 +50,8 @@ class GreenBack():
         # focus模式下强制输出宽高
         self.focus_out_h = 0
         self.focus_out_w = 0
+        # 是否启用softmask
+        self.soft_mask = False
         # 多线程处理mask,根据电脑实际情况配置，videowriter是瓶颈就减少，mask处理是瓶颈就增加
         self.sem = threading.Semaphore(14)
         # 图片写入视频线程所用队列的信号
@@ -105,41 +108,45 @@ class GreenBack():
             else:
                 crop = self.backimg
         else:
-            # 读取为BGR
-            if self.cupyflag:
-                red_mask_img = cp.asarray(cv2.imread(red_mask_file))
-            else:
-                red_mask_img = cv2.imread(red_mask_file)
-            
-            if self.focus_flag == True:
+            if self.soft_mask == True:
+                tmpimg = Image.open(red_mask_file).convert('L')  # 使用'L'模式确保图片是灰度的
+                red_mask_img_grey = np.array(tmpimg)
+            else:    
+                # 读取为BGR
                 if self.cupyflag:
-                    red_pixels = cp.logical_and(red_mask_img[:, :, 2] == 128, red_mask_img[:, :, 1] == 0)
+                    red_mask_img = cp.asarray(cv2.imread(red_mask_file))
                 else:
-                    red_pixels = np.logical_and(red_mask_img[:, :, 2] == 128, red_mask_img[:, :, 1] == 0)
-                # print(red_pixels)
-                red_mask_img[red_pixels] = [255, 255, 255]
-            else:
-                # 背景为黑色，构造黑色mask
-                if self.cupyflag:
-                    black_mask = cp.logical_and(red_mask_img[:, :, 2] == 0, red_mask_img[:, :, 1] == 0, red_mask_img[:, :, 0] == 0)
-                else:
-                    black_mask = np.logical_and(red_mask_img[:, :, 2] == 0, red_mask_img[:, :, 1] == 0, red_mask_img[:, :, 0] == 0)
-                # 非黑色mask合并成白色
-                red_mask_img[~black_mask] = [255,255,255]
-
-            if self.cupyflag:
-                red_mask_img = cp.asnumpy(red_mask_img)
-
-            # 转为灰度图
-            red_mask_img_grey = cv2.cvtColor(red_mask_img, cv2.COLOR_BGR2GRAY)
+                    red_mask_img = cv2.imread(red_mask_file)
                 
+                if self.focus_flag == True:
+                    if self.cupyflag:
+                        red_pixels = cp.logical_and(red_mask_img[:, :, 2] == 128, red_mask_img[:, :, 1] == 0)
+                    else:
+                        red_pixels = np.logical_and(red_mask_img[:, :, 2] == 128, red_mask_img[:, :, 1] == 0)
+                    # print(red_pixels)
+                    red_mask_img[red_pixels] = [255, 255, 255]
+                else:
+                    # 背景为黑色，构造黑色mask
+                    if self.cupyflag:
+                        black_mask = ((red_mask_img[:, :, 2] == 0) & (red_mask_img[:, :, 1] == 0) & (red_mask_img[:, :, 0] == 0))
+                    else:
+                        black_mask = ((red_mask_img[:, :, 2] == 0) & (red_mask_img[:, :, 1] == 0) & (red_mask_img[:, :, 0] == 0))
+
+                    # 非黑色mask合并成白色
+                    red_mask_img[~black_mask] = [255,255,255]
+
+                if self.cupyflag:
+                    red_mask_img = cp.asnumpy(red_mask_img)
+
+                # 转为灰度图
+                red_mask_img_grey = cv2.cvtColor(red_mask_img, cv2.COLOR_BGR2GRAY)   
             # 图片缩放
             red_mask_img_grey = cv2.resize(red_mask_img_grey, (w, h),cv2.INTER_CUBIC)
             
             # 消除噪点：使用腐蚀加扩展消除噪点，效果不好，暂时不用
-            # kernel = np.ones((3,3), np.uint8)
+            kernel = np.ones((10,10), np.uint8)
             # red_mask_img = cv2.dilate(red_mask_img, kernel, iterations = 1)
-            # mask = cv2.erode(mask, kernel, iterations = 1)
+            red_mask_img_grey = cv2.erode(red_mask_img_grey, kernel, iterations = 1)
             
             # 抗锯齿：使用中值滤波消除锯齿，效果不错，但很吃cpu
             # red_mask_img_grey = cv2.medianBlur(red_mask_img_grey, mask_ksize)
@@ -153,7 +160,8 @@ class GreenBack():
             # 第三个参数：upper_red指的是图像中高于这个upper_red的值，图像值变为0
             # 而在lower_red～upper_red之间的值变成255
             # 临近色0-127
-            mask = cv2.inRange(red_mask_img_grey, 0, self.mask_range)
+            # mask = cv2.inRange(red_mask_img_grey, 0, self.mask_range)
+            mask = red_mask_img_grey
 
             # 一些调试打印信息
             # cv2.imwrite(dst_file+'.jpg',red_mask_img_grey)
@@ -219,8 +227,13 @@ class GreenBack():
                     crop = img
 
                 if self.backimg is None:
-                    # 将绿色mask部分填充为绿色
-                    crop[mask == 255] = [0,255,0] 
+                    # 为透明通道置位
+                    if self.cupyflag:
+                        rgba_image = cp.dstack((crop, mask))
+                    else:
+                        rgba_image = np.dstack((crop, mask))
+                    # rgba_image[mask == 0, 3] = 255
+                    crop = rgba_image
                 else: 
                     # 将绿色mask部分填充为背景
                     rows, cols = crop.shape[:2]
@@ -234,6 +247,7 @@ class GreenBack():
             if self.cupyflag:
                 crop = cp.asnumpy(crop)
             self.out_crop_list[frame_index] = crop
+            # print(crop.shape)
         self.sem.release()
 
     def write_out_crop(self):
@@ -373,6 +387,7 @@ class GreenBack():
         object_num = config['config']['object_num']
         object_num = int(object_num)
         self.focus_flag = config.getboolean('config','focus_mode')
+        self.soft_mask = config.getboolean('config', 'soft_mask')
         # mask图片中非mask部分的hsv通道中的h，不能为黑色，红0，绿120，蓝240，Xmem分割单对象默认为红色
         none_mask_color_hue = 0
 
@@ -380,11 +395,14 @@ class GreenBack():
         if self.focus_flag == True:
             dst_file = 'workspace/%s/focus.mp4' % src_file_name
         else:
-            dst_file = 'workspace/%s/greenback.mp4' % src_file_name
+            dst_file = 'workspace/%s/greenback.webm' % src_file_name
 
         # open up video
         cap = cv2.VideoCapture(src_file)
-        red_mask_list = sorted(glob.glob('workspace/%s/masks/*.png' % src_file_name))
+        if self.soft_mask == True:
+            red_mask_list = sorted(glob.glob('workspace/%s/soft_masks/1/*.png' % src_file_name))
+        else:
+            red_mask_list = sorted(glob.glob('workspace/%s/masks/*.png' % src_file_name))
         backimg_path = None
         # backimg_path = "1.jpg"
 
@@ -455,7 +473,10 @@ class GreenBack():
             # -crf 24              Constant quality encoding (lower value for higher quality and larger output file).
             # {output_filename}    Output file name: output_filename (output.mp4)
             # 如遇错误：Picture width must be an integer multiple of the specified chroma subsampling，是指yuv420p格式下视频长宽必须是2（或4）的倍数，源图片需要缩放大小
-            self.out = sp.Popen(shlex.split(f'ffmpeg -y -loglevel warning -f rawvideo -pix_fmt bgr24 -s {self.out_w}x{self.out_h} -r {framerate} -thread_queue_size 64 -i pipe: -i {src_file} -map 0:v -map 1:a? {self.codec} -pix_fmt yuv420p -c:a copy -shortest {dst_file}'), stdin=sp.PIPE)
+            # self.out = sp.Popen(shlex.split(f'ffmpeg -y -loglevel warning -f rawvideo -pix_fmt bgr24 -s {self.out_w}x{self.out_h} -r {framerate} -thread_queue_size 64 -i pipe: -i {src_file} -map 0:v -map 1:a? {self.codec} -pix_fmt yuv420p -c:a copy -shortest {dst_file}'), stdin=sp.PIPE)
+            # ffmpeg -i input.mp4 -c:v libvpx-vp9 -b:v 2M -auto-alt-ref 0 -c:a libopus output.webm
+            self.out = sp.Popen(shlex.split(f'ffmpeg -y -loglevel warning -f rawvideo -pix_fmt bgra -s {self.out_w}x{self.out_h} -r {framerate} -thread_queue_size 64 -i pipe: -i {src_file} -map 0:v -map 1:a? {self.codec} -pix_fmt yuva420p -c:a libopus -b:a 96k -shortest {dst_file}'), stdin=sp.PIPE)
+            
 
         if self.videoreader_flag == False:
             cap.release()
@@ -477,8 +498,8 @@ class GreenBack():
 
         max_red_mask_file_index = int(os.path.splitext(os.path.basename(red_mask_list[len(red_mask_list)-1]))[0])
         if self.test_mode:
-            if max_red_mask_file_index > 600:
-                max_red_mask_file_index = 600
+            if max_red_mask_file_index > 120:
+                max_red_mask_file_index = 120
 
         # 创建纯绿色图片
         self.green_img = np.zeros([self.out_h, self.out_w, 3], np.uint8)
@@ -535,8 +556,8 @@ class GreenBack():
             thread_pool.submit(self.apply_mask,frame_index,img)
             self.write_sem.release()
             # 队列里待处理的过多，暂停一下
-            if len(self.out_crop_list) > 10:
-                time.sleep(0.1)
+            if len(self.out_crop_list) > 20:
+                time.sleep(1)
             frame_index  = frame_index + 1
 
         if self.focus_phase == 1 and self.focus_flag == True:
