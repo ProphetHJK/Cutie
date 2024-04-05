@@ -10,6 +10,8 @@ import ffmpeg
 import threading
 import subprocess as sp
 import shlex
+import copy
+import matplotlib.pyplot as plt
 cupy_enable = True
 try:
     import cupy as cp
@@ -35,10 +37,16 @@ class GreenBack():
         self.videowriter_flag = False
         # 使用opencv提供的VideoCapture功能，否则使用ffmpeg
         self.videoreader_flag = True
-        # 测试模式，仅生成最多120帧视频
+        # 测试模式
         self.test_mode = False
+        # 源文件名
+        self.file_name = ""
+        # 卷积和
+        self.ekernel = None
         # mask中值滤波的ksize，越大越平滑，但细节丢失也越大,高斯41等效中值21
-        self.mask_ksize = 41
+        self.mask_ksize = 0
+        # mask侵蚀的ksize,608 5,1080p 7,2160 12
+        self.mask_esize = 7
         # mask范围，1-254，越大绿幕的范围越大
         self.mask_range = 180
         # 是否启用跟踪
@@ -74,6 +82,8 @@ class GreenBack():
         self.green_img = None
         # 背景图片
         self.backimg = None
+        # 马赛克背景
+        self.masaikeimg = None
         # 读入帧高
         self.h = 0
         # 读入帧宽
@@ -83,6 +93,30 @@ class GreenBack():
         # 输出帧宽
         self.out_w = 0
 
+    def overlay_image_with_mask(self,background, overlay, mask, x=0, y=0):
+        """利用mask将BGR图像叠加到背景上"""
+        h, w = overlay.shape[:2]
+        alpha = mask / 255.0
+        tmpbackground = copy.deepcopy(background)
+        for c in range(0, 3):
+            tmpbackground[y:y+h, x:x+w, c] = (alpha * overlay[:, :, c] +
+                                        (1-alpha) * tmpbackground[y:y+h, x:x+w, c])
+        return tmpbackground
+    def create_checkerboard(self,bwidth:int, bheight:int, tile_size:int=100):
+        """创建一个灰白相间的马赛克背景"""
+        # 计算每种颜色的方块数量
+        num_tiles_x = bwidth // tile_size
+        num_tiles_y = bheight // tile_size
+        # 创建一个空的图像
+        checkerboard = np.zeros((bheight, bwidth, 3), dtype=np.uint8)
+        # 填充方块
+        for y in range(num_tiles_y):
+            for x in range(num_tiles_x):
+                if (x + y) % 2:
+                    checkerboard[y*tile_size:(y+1)*tile_size, x*tile_size:(x+1)*tile_size] = 255  # 白色
+                else:
+                    checkerboard[y*tile_size:(y+1)*tile_size, x*tile_size:(x+1)*tile_size] = 127  # 灰色
+        return checkerboard
     def convert_str_to_float(self, s: str) -> float:
         """Convert rational or decimal string to float
         """
@@ -100,8 +134,8 @@ class GreenBack():
     def apply_mask(self,frame_index,img):
         w = self.w
         h = self.h
-        red_mask_file = self.appended_red_mask_list[frame_index]
-        if red_mask_file is None:
+        red_mask_file_list = self.appended_red_mask_list[frame_index]
+        if red_mask_file_list is None:
             # print('\nError,frame_num error,frame_num:%d\n' % (frame_num))
             if self.backimg is None:
                 crop = self.green_img
@@ -109,9 +143,16 @@ class GreenBack():
                 crop = self.backimg
         else:
             if self.soft_mask == True:
-                tmpimg = Image.open(red_mask_file).convert('L')  # 使用'L'模式确保图片是灰度的
-                red_mask_img_grey = np.array(tmpimg)
-            else:    
+                # 使用'L'模式确保图片是灰度的
+                tmpimgs = [np.array(Image.open(img_path1).convert('L')) for img_path1 in red_mask_file_list]
+                # 使用求和的方式叠加图片
+                # 注意：这里直接求和可能导致数值超出255的有效灰度范围
+                combined_image = np.sum(tmpimgs, axis=0)
+
+                # 为了防止溢出，我们将数值限制在0到255的范围内
+                red_mask_img_grey = np.clip(combined_image, 0, 255).astype(np.uint8)
+            else:
+                red_mask_file = red_mask_file_list[0]
                 # 读取为BGR
                 if self.cupyflag:
                     red_mask_img = cp.asarray(cv2.imread(red_mask_file))
@@ -142,17 +183,15 @@ class GreenBack():
                 red_mask_img_grey = cv2.cvtColor(red_mask_img, cv2.COLOR_BGR2GRAY)   
             # 图片缩放
             red_mask_img_grey = cv2.resize(red_mask_img_grey, (w, h),cv2.INTER_CUBIC)
-            
             # 消除噪点：使用腐蚀加扩展消除噪点，效果不好，暂时不用
-            kernel = np.ones((10,10), np.uint8)
             # red_mask_img = cv2.dilate(red_mask_img, kernel, iterations = 1)
-            red_mask_img_grey = cv2.erode(red_mask_img_grey, kernel, iterations = 1)
+            red_mask_img_grey = cv2.erode(red_mask_img_grey, self.ekernel, iterations = 1)
             
             # 抗锯齿：使用中值滤波消除锯齿，效果不错，但很吃cpu
             # red_mask_img_grey = cv2.medianBlur(red_mask_img_grey, mask_ksize)
             # 抗锯齿：使用高斯滤波，性能和效果都不错
-            if self.focus_flag == False:
-                red_mask_img_grey = cv2.GaussianBlur(red_mask_img_grey, (self.mask_ksize,self.mask_ksize),0)
+            # if self.focus_flag == False:
+            #     red_mask_img_grey = cv2.GaussianBlur(red_mask_img_grey, (self.mask_ksize,self.mask_ksize),0)
 
             # 提取黑色（0）及其临近色（1-127）构建mask矩阵，处理后mask矩阵中黑色为255，非黑色为0，和像素点一一对应
             # 第一个参数：原始值
@@ -246,7 +285,39 @@ class GreenBack():
         if self.focus_flag == False or self.focus_phase != 1:
             if self.cupyflag:
                 crop = cp.asnumpy(crop)
-            self.out_crop_list[frame_index] = crop
+            if self.test_mode == True:
+                outputimg = self.overlay_image_with_mask(self.masaikeimg, crop , mask)
+                save_path = 'testimg{}/result_with_mask-{}-{}-{}.jpg'.format(self.file_name,self.mask_ksize,self.mask_esize,frame_index)
+
+                # 检查目录是否存在，如果不存在则创建
+                if not os.path.exists(os.path.dirname(save_path)):
+                    os.makedirs(os.path.dirname(save_path))
+
+                # 现在可以安全地保存图像
+                cv2.imwrite(save_path, outputimg)
+                
+                # #显示原图
+                # plt.subplot(3,2,1),plt.imshow(img,cmap = "gray")
+                # plt.title("Original")
+                # #显示处理后的图
+                # plt.subplot(3,2,2),plt.imshow(opening,cmap ="gray")
+                # plt.title("opening")
+                
+                # plt.subplot(3,2,3),plt.imshow(img1,cmap = "gray")
+                # plt.title("Original")
+                # #显示处理后的图
+                # plt.subplot(3,2,4),plt.imshow(closing,cmap ="gray")
+                # plt.title("closing")
+                
+                # plt.subplot(3,2,5),plt.imshow(img2,cmap = "gray")
+                # plt.title("Original")
+                # #显示处理后的图
+                # plt.subplot(3,2,6),plt.imshow(gradient,cmap ="gray")
+                # plt.title("gradient")
+                # plt.show()
+  
+            else:
+                self.out_crop_list[frame_index] = crop
             # print(crop.shape)
         self.sem.release()
 
@@ -383,11 +454,14 @@ class GreenBack():
         config = configparser.ConfigParser()
         config.read('tools/config.ini',encoding='utf8')
         src_file_name = config['config']['src_file_name']
+        self.file_name = src_file_name
         src_file_ext = config['config']['src_file_ext']
         object_num = config['config']['object_num']
         object_num = int(object_num)
         self.focus_flag = config.getboolean('config','focus_mode')
         self.soft_mask = config.getboolean('config', 'soft_mask')
+        self.test_mode = config.getboolean('config', 'test_mode')
+        self.ekernel = np.ones((self.mask_esize,self.mask_esize), np.uint8)
         # mask图片中非mask部分的hsv通道中的h，不能为黑色，红0，绿120，蓝240，Xmem分割单对象默认为红色
         none_mask_color_hue = 0
 
@@ -400,9 +474,16 @@ class GreenBack():
         # open up video
         cap = cv2.VideoCapture(src_file)
         if self.soft_mask == True:
-            red_mask_list = sorted(glob.glob('workspace/%s/soft_masks/1/*.png' % src_file_name))
+            tmp_mask_list = []
+            for i in range(0,object_num):
+                tmp_mask_list.append(sorted(glob.glob('workspace/{}/soft_masks/{}/*.png'.format(src_file_name,i+1))))
+            red_mask_list = [list(group) for group in zip(*tmp_mask_list)]
+            with open('output.txt', 'w') as file:
+                # 将数组转换为字符串，并写入文件
+                file.write(str(red_mask_list))
         else:
             red_mask_list = sorted(glob.glob('workspace/%s/masks/*.png' % src_file_name))
+            red_mask_list = red_mask_list.reshape(-1, 1)
         backimg_path = None
         # backimg_path = "1.jpg"
 
@@ -492,18 +573,20 @@ class GreenBack():
             self.appended_red_mask_list[i] = None
 
         for i in range(0,len(red_mask_list)):
-            mask_filename = os.path.splitext(os.path.basename(red_mask_list[i]))[0]
+            mask_filename = os.path.splitext(os.path.basename(red_mask_list[i][0]))[0]
             mask_filename_int = int(mask_filename)
             self.appended_red_mask_list[mask_filename_int] = red_mask_list[i]
+        
+        if self.appended_red_mask_list[0] is None:
+            self.appended_red_mask_list[0] = self.appended_red_mask_list[1]
 
-        max_red_mask_file_index = int(os.path.splitext(os.path.basename(red_mask_list[len(red_mask_list)-1]))[0])
-        if self.test_mode:
-            if max_red_mask_file_index > 120:
-                max_red_mask_file_index = 120
+        max_red_mask_file_index = int(os.path.splitext(os.path.basename(red_mask_list[len(red_mask_list)-1][0]))[0])
 
         # 创建纯绿色图片
         self.green_img = np.zeros([self.out_h, self.out_w, 3], np.uint8)
         self.green_img[:, :, 1] = np.zeros([self.out_h, self.out_w]) + 255
+        
+        self.masaikeimg = self.create_checkerboard(self.out_w,self.out_h)
 
         end = time.time() - start
         print('初始化完成：用时：{}'.format(end))
@@ -552,6 +635,11 @@ class GreenBack():
             #                 appended_red_mask_list[frame_index],frame_index,img,w,h,None,out_crop_list,cupyflag,img_green,object_num))
             # sem.acquire()
             # thread.start()
+            if self.test_mode == True:
+                indices = np.linspace(60, max_red_mask_file_index - 60, 10, dtype=int)
+                if frame_index not in indices:
+                    frame_index = frame_index + 1
+                    continue
             self.sem.acquire()
             thread_pool.submit(self.apply_mask,frame_index,img)
             self.write_sem.release()
