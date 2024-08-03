@@ -38,7 +38,7 @@ class GreenBack():
         # 使用opencv提供的VideoCapture功能，否则使用ffmpeg
         self.videoreader_flag = True
         # 测试模式
-        self.test_mode = False
+        self.test_mode = 0
         # 源文件名
         self.file_name = ""
         # 卷积和
@@ -46,7 +46,7 @@ class GreenBack():
         # mask中值滤波的ksize，越大越平滑，但细节丢失也越大,高斯41等效中值21
         self.mask_ksize = 0
         # mask侵蚀的ksize,608 5,1080p 7,2160 12
-        self.mask_esize = 7
+        self.mask_esize = 10
         # mask范围，1-254，越大绿幕的范围越大
         self.mask_range = 180
         # 是否启用跟踪
@@ -285,7 +285,7 @@ class GreenBack():
         if self.focus_flag == False or self.focus_phase != 1:
             if self.cupyflag:
                 crop = cp.asnumpy(crop)
-            if self.test_mode == True:
+            if self.test_mode == 1:
                 outputimg = self.overlay_image_with_mask(self.masaikeimg, crop , mask)
                 save_path = 'testimg{}/result_with_mask-{}-{}-{}.jpg'.format(self.file_name,self.mask_ksize,self.mask_esize,frame_index)
 
@@ -460,7 +460,7 @@ class GreenBack():
         object_num = int(object_num)
         self.focus_flag = config.getboolean('config','focus_mode')
         self.soft_mask = config.getboolean('config', 'soft_mask')
-        self.test_mode = config.getboolean('config', 'test_mode')
+        self.test_mode = int(config['config']['test_mode'])
         self.ekernel = np.ones((self.mask_esize,self.mask_esize), np.uint8)
         # mask图片中非mask部分的hsv通道中的h，不能为黑色，红0，绿120，蓝240，Xmem分割单对象默认为红色
         none_mask_color_hue = 0
@@ -563,7 +563,8 @@ class GreenBack():
             cap.release()
             cap = sp.Popen(shlex.split(f'ffmpeg -i {src_file} -f rawvideo -pix_fmt bgr24 pipe:'), stdout=sp.PIPE)
 
-        src_max_framenum = int(total_framenum) - 1
+        # src_max_framenum = int(total_framenum) - 1
+        src_max_framenum = len(red_mask_list) - 1
         self.max_frame_num = total_framenum
 
         #源视频帧序号
@@ -635,7 +636,7 @@ class GreenBack():
             #                 appended_red_mask_list[frame_index],frame_index,img,w,h,None,out_crop_list,cupyflag,img_green,object_num))
             # sem.acquire()
             # thread.start()
-            if self.test_mode == True:
+            if self.test_mode == 1:
                 indices = np.linspace(60, max_red_mask_file_index - 60, 10, dtype=int)
                 if frame_index not in indices:
                     frame_index = frame_index + 1
